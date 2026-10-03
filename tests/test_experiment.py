@@ -349,15 +349,24 @@ class DeterminismTests(unittest.TestCase):
         self.assertIsNone(rec["vs_fp32_losstol"])
 
         # Validate that printing doesn't throw formatting errors on None values
+        # and that UNSUPPORTED records do not evaluate cross-GPU agreement
         import io
         from contextlib import redirect_stdout
-        buf = io.StringIO()
-        with redirect_stdout(buf):
-            print_grid(records)
-            print_verdict_table(records)
+        with tempfile.NamedTemporaryFile("w+", suffix=".jsonl") as tmp:
+            tmp.write(json.dumps({"model": "lstm", "condition": "bf16 det-on", "param_sha256": "fakehash"}) + "\n")
+            tmp.flush()
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                print_grid(records)
+                print_verdict_table(records, cross_gpu_results=tmp.name)
         out = buf.getvalue()
         self.assertIn("UNSUP", out)
         self.assertIn("UNSUPPORTED", out)
+        for line in out.splitlines():
+            if line.startswith("lstm") and "bf16 det-on" in line:
+                self.assertIn("-", line)
+                self.assertNotIn("DIFF", line)
+                self.assertNotIn("SAME", line)
 
     def test_lstm_cpu_bf16_runtime_error_converted_in_single_train(self):
         from unittest.mock import patch
@@ -370,6 +379,16 @@ class DeterminismTests(unittest.TestCase):
         self.assertEqual(rec["status"], "UNSUPPORTED")
         self.assertIn("oneDNN on CPU has no LSTM bf16", rec["unsupported_reason"])
         self.assertIsNone(rec["final_loss"])
+
+    def test_unrelated_lstm_runtime_error_not_caught_as_unsupported(self):
+        from unittest.mock import patch
+        from experiment import run_one
+
+        with patch("experiment.check_kernel_support"):
+            with patch("experiment._single_train", side_effect=RuntimeError("lstm generic internal error")):
+                with self.assertRaises(RuntimeError) as cm:
+                    run_one("lstm", "shakespeare", "bf16", True, device="cpu", overrides=SMOKE, quiet=True)
+                self.assertIn("lstm generic internal error", str(cm.exception))
 
     def test_check_kernel_support_non_cpu_or_non_lstm(self):
         from experiment import check_kernel_support

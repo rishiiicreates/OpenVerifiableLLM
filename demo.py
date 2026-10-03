@@ -74,7 +74,7 @@ def print_verdict_table(records, cross_gpu_results=None):
         first_div = "-" if fd is None else f"step {fd}"
         xg = "-"
         key = (r["model"], r.get("condition"))
-        if key in cross:
+        if r.get("status") != "UNSUPPORTED" and key in cross:
             xg = "SAME" if cross[key] == r.get("param_sha256") else "DIFF"
         print(f"{r['model']:<8}{r['condition']:<14}{repro:<14}{xg:<12}{first_div:<18}")
     print("-" * 66)

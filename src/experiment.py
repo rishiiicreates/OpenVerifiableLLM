@@ -76,7 +76,7 @@ def check_kernel_support(model_name, precision, dev):
                 probe_lstm(probe_x)
         except RuntimeError as e:
             err_msg = str(e).lower()
-            if "primitive descriptor" in err_msg or "onednn" in err_msg or "lstm" in err_msg:
+            if "primitive descriptor" in err_msg:
                 raise UnsupportedKernelError("oneDNN on CPU has no LSTM bf16 forward primitive") from e
             raise
 
@@ -159,7 +159,7 @@ def _single_train(model_name, dataset_name, precision, deterministic, seed, dev,
     except RuntimeError as e:
         err_msg = str(e).lower()
         if dev.type == "cpu" and model_name == "lstm" and precision == "bf16" and (
-            "primitive descriptor" in err_msg or "onednn" in err_msg or "lstm" in err_msg
+            "primitive descriptor" in err_msg
         ):
             raise UnsupportedKernelError("oneDNN on CPU has no LSTM bf16 forward primitive") from e
         raise
@@ -225,7 +225,7 @@ def run_one(model_name, dataset_name="shakespeare", precision="fp32",
         err_msg = str(err).lower()
         if isinstance(err, UnsupportedKernelError) or (
             dev.type == "cpu" and model_name == "lstm" and precision == "bf16" and (
-                "primitive descriptor" in err_msg or "onednn" in err_msg or "lstm" in err_msg
+                "primitive descriptor" in err_msg
             )
         ):
             reason = "oneDNN on CPU has no LSTM bf16 forward primitive" if isinstance(err, RuntimeError) else str(err)
