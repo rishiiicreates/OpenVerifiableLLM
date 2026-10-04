@@ -142,6 +142,14 @@ class TestCIFARDatasetIntegrity(unittest.TestCase):
                 self.assertEqual(ds.name, "cifar")
                 self.assertEqual(ds.vocab_size, 10)
 
+    def test_cifar_raises_on_filesystem_permission_error(self):
+        """Filesystem errors during download must propagate and not trigger synthetic fallback."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            with patch("dataset._download", side_effect=PermissionError("Read-only filesystem")):
+                with self.assertRaises(PermissionError):
+                    CIFARDataset(data_dir=tmp_path)
+
 
 if __name__ == "__main__":
     unittest.main()

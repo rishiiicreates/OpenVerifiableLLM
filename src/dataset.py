@@ -34,7 +34,6 @@ _NETWORK_ERRORS = (
     TimeoutError,
     ConnectionError,
     http.client.HTTPException,
-    OSError,
 )
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
@@ -230,7 +229,10 @@ class CIFARDataset:
                     target_path = (self.data_dir / member.name).resolve()
                     if not target_path.is_relative_to(self.data_dir.resolve()):
                         raise ValueError(f"Unsafe path in archive: {member.name}")
-                tf.extractall(self.data_dir)
+                if hasattr(tarfile, "data_filter"):
+                    tf.extractall(self.data_dir, filter="data")
+                else:
+                    tf.extractall(self.data_dir)
 
         import pickle
 
