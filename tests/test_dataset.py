@@ -58,7 +58,7 @@ class TestCIFARDatasetIntegrity(unittest.TestCase):
             self.assertIn("Unsafe path in archive", str(ctx.exception))
 
     def test_cifar_raises_on_corrupted_pickle_batch(self):
-        """Corrupted local batch files must raise UnpicklingError / EOFError."""
+        """Corrupted local batch files must raise UnpicklingError or EOFError."""
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
             batch_dir = tmp_path / "cifar-10-batches-py"
@@ -67,10 +67,8 @@ class TestCIFARDatasetIntegrity(unittest.TestCase):
             # Write corrupted garbage to data_batch_1
             (batch_dir / "data_batch_1").write_bytes(b"garbage-non-pickle-data")
 
-            with self.assertRaises((pickle.UnpicklingError, EOFError, Exception)) as ctx:
+            with self.assertRaises((pickle.UnpicklingError, EOFError)):
                 CIFARDataset(data_dir=tmp_path)
-            # Must NOT be swallowed into synthetic fallback
-            self.assertNotIsInstance(ctx.exception, AssertionError)
 
     def test_cifar_raises_on_malformed_batch_structure(self):
         """Valid pickle but invalid internal CIFAR dictionary structure must raise ValueError."""
