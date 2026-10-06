@@ -180,6 +180,38 @@ class TestTokenizeDatasetPipeline(unittest.TestCase):
         with self.assertRaises(TypeError):
             tokenize_dataset(self.text_file, object(), self.output_bin)
 
+    def test_samefile_rejection(self):
+        with self.assertRaises(ValueError):
+            tokenize_dataset(self.text_file, self.tok_dir, self.text_file)
+
+    def test_token_id_range_validation(self):
+        class DummyNegativeTokenizer:
+            def encode(self, text):
+                return [-1, 5]
+
+        class DummyOverflowTokenizer:
+            def encode(self, text):
+                return [70000]
+
+        with self.assertRaises(ValueError):
+            tokenize_dataset(self.text_file, DummyNegativeTokenizer(), self.output_bin, write_manifest=False)
+
+        with self.assertRaises(ValueError):
+            tokenize_dataset(self.text_file, DummyOverflowTokenizer(), self.output_bin, dtype="uint16", write_manifest=False)
+
+    def test_manifest_provenance_requirement(self):
+        class DummyValidTokenizer:
+            def encode(self, text):
+                return [1, 2, 3]
+
+        # Fails when write_manifest=True without valid tokenizer dir
+        with self.assertRaises(ValueError):
+            tokenize_dataset(self.text_file, DummyValidTokenizer(), self.output_bin, write_manifest=True)
+
+        # Passes cleanly when write_manifest=False
+        m = tokenize_dataset(self.text_file, DummyValidTokenizer(), self.output_bin, write_manifest=False)
+        self.assertGreater(m["total_tokens"], 0)
+
     def test_determinism_across_runs(self):
         out1 = self.tmp / "run1.bin"
         out2 = self.tmp / "run2.bin"

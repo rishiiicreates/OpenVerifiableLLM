@@ -32,6 +32,10 @@ DTYPE_MAP = {
     "uint16": np.dtype("<u2"),
     "uint32": np.dtype("<u4"),
 }
+DTYPE_RANGES = {
+    "uint16": (0, 65535),
+    "uint32": (0, 4294967295),
+}
 
 
 def _canonical_json(obj: Any) -> str:
@@ -81,6 +85,16 @@ def tokenize_dataset(
     if not input_path.is_file():
         raise FileNotFoundError(f"Input dataset file not found: {input_path}")
 
+    if output_path.exists():
+        try:
+            if input_path.samefile(output_path):
+                raise ValueError(f"Input file and output file cannot be the same file: {input_path}")
+        except OSError:
+            if input_path.resolve() == output_path.resolve():
+                raise ValueError(f"Input file and output file cannot be the same file: {input_path}")
+    elif input_path.resolve() == output_path.resolve():
+        raise ValueError(f"Input file and output file cannot be the same file: {input_path}")
+
     if dtype not in SUPPORTED_DTYPES:
         raise ValueError(
             f"Unsupported dtype: '{dtype}'. Supported dtypes are: {sorted(SUPPORTED_DTYPES)}"
@@ -95,6 +109,8 @@ def tokenize_dataset(
         tok_instance = load_tokenizer(tokenizer_dir)
     elif isinstance(tokenizer, BaseTokenizer):
         tok_instance = tokenizer
+        if hasattr(tokenizer, "tokenizer_dir") and tokenizer.tokenizer_dir:
+            tokenizer_dir = Path(tokenizer.tokenizer_dir)
     else:
         tok_instance = tokenizer
 
@@ -103,10 +119,18 @@ def tokenize_dataset(
             f"Tokenizer instance must implement a callable encode() method, got {type(tok_instance).__name__}"
         )
 
+    if write_manifest:
+        if tokenizer_dir is None or not tokenizer_dir.is_dir():
+            raise ValueError(
+                "A valid tokenizer artifact directory must be provided when write_manifest=True "
+                "to compute tokenizer provenance hashes. Pass write_manifest=False if skipping manifest."
+            )
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Use explicit little-endian byte ordering for guaranteed cross-platform reproducibility
     np_dtype = DTYPE_MAP[dtype]
+    min_val, max_val = DTYPE_RANGES[dtype]
 
     total_tokens = 0
     total_bytes = 0
@@ -133,6 +157,14 @@ def tokenize_dataset(
             if not token_ids:
                 continue
 
+            for tid in token_ids:
+                if not isinstance(tid, (int, np.integer)) or isinstance(tid, bool):
+                    raise TypeError(f"Token ID must be an integer, got {type(tid).__name__}: {tid}")
+                if tid < min_val or tid > max_val:
+                    raise ValueError(
+                        f"Token ID {tid} is outside allowable range [{min_val}, {max_val}] for {dtype}"
+                    )
+
             arr = np.array(token_ids, dtype=np_dtype)
             raw_bytes = arr.tobytes()
             fout.write(raw_bytes)
@@ -156,10 +188,7 @@ def tokenize_dataset(
 
     tok_config: Optional[Dict[str, Any]] = None
     if tokenizer_dir is not None and tokenizer_dir.is_dir():
-        try:
-            tok_config = hash_tokenizer_config(tokenizer_dir)
-        except Exception as e:
-            logger.warning("Could not compute tokenizer config hash: %s", e)
+        tok_config = hash_tokenizer_config(tokenizer_dir)
 
     manifest_data: Dict[str, Any] = {
         "version": "1.0.0",
