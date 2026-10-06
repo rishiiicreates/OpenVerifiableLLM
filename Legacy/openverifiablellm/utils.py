@@ -199,6 +199,20 @@ def _compute_input_identity(input_path: Path) -> str:
     return compute_sha256(file_path=input_path)
 
 
+def _compute_file_prefix_sha256(file_path: Path, length: int) -> str:
+    """Compute SHA256 of the first `length` bytes of a file."""
+    h = hashlib.sha256()
+    remaining = length
+    with file_path.open("rb") as f:
+        while remaining > 0:
+            chunk = f.read(min(remaining, 65536))
+            if not chunk:
+                break
+            h.update(chunk)
+            remaining -= len(chunk)
+    return h.hexdigest()
+
+
 def _load_checkpoint(checkpoint_path: Path, input_path: Path, output_path: Path) -> Dict[str, Any]:
     """Load checkpoint safely and validate resume conditions."""
     if not checkpoint_path.exists():
@@ -208,26 +222,42 @@ def _load_checkpoint(checkpoint_path: Path, input_path: Path, output_path: Path)
         with checkpoint_path.open("r", encoding="utf-8") as f:
             data = json.load(f)
 
-        pages_processed = data.get("pages_processed")
+        if not isinstance(data, dict):
+            raise ValueError("Checkpoint payload must be a JSON object")
+
+        if "pages_processed" not in data:
+            raise ValueError("Missing pages_processed in checkpoint")
+        pages_processed = data["pages_processed"]
+
+        if "file_offset" not in data:
+            raise ValueError("Missing file_offset in checkpoint")
+        file_offset = data["file_offset"]
+
         stored_identity = data.get("input_identity")
-        file_offset = data.get("file_offset", 0)
+        stored_prefix_hash = data.get("output_prefix_hash")
 
         current_identity = _compute_input_identity(input_path)
 
-        if not isinstance(pages_processed, int) or pages_processed < 0:
+        if not isinstance(pages_processed, int) or isinstance(pages_processed, bool) or pages_processed < 0:
             raise ValueError("Invalid pages_processed value")
 
         if stored_identity != current_identity:
             raise ValueError("Input file changed since checkpoint")
 
-        if pages_processed > 0 and not output_path.exists():
-            raise ValueError("Output file missing; cannot safely resume")
-
-        if not isinstance(file_offset, int) or file_offset < 0:
+        if not isinstance(file_offset, int) or isinstance(file_offset, bool) or file_offset < 0:
             raise ValueError("Invalid file_offset value")
 
-        if pages_processed > 0 and output_path.stat().st_size < file_offset:
-            raise ValueError("Output file smaller than checkpoint offset")
+        if pages_processed > 0:
+            if not output_path.exists():
+                raise ValueError("Output file missing; cannot safely resume")
+
+            if output_path.stat().st_size < file_offset:
+                raise ValueError("Output file smaller than checkpoint offset")
+
+            if stored_prefix_hash is not None:
+                actual_prefix_hash = _compute_file_prefix_sha256(output_path, file_offset)
+                if actual_prefix_hash != stored_prefix_hash:
+                    raise ValueError("Output prefix digest mismatch; output was modified")
 
         logger.info("Resuming from checkpoint: %d pages already processed", pages_processed)
 
@@ -243,16 +273,19 @@ def _save_checkpoint(
     pages_processed: int,
     input_identity: str,
     file_offset: int = 0,
+    output_prefix_hash: Optional[str] = None,
 ) -> None:
-    """Atomically save checkpoint with input identity and file offset."""
+    """Atomically save checkpoint with input identity, file offset, and prefix hash."""
     tmp = checkpoint_path.with_suffix(".tmp")
 
     try:
-        checkpoint_data = {
+        checkpoint_data: Dict[str, Any] = {
             "pages_processed": pages_processed,
             "input_identity": input_identity,
             "file_offset": file_offset,
         }
+        if output_prefix_hash is not None:
+            checkpoint_data["output_prefix_hash"] = output_prefix_hash
 
         with tmp.open("w", encoding="utf-8") as f:
             json.dump(checkpoint_data, f)
@@ -322,6 +355,10 @@ def extract_text_from_xml(input_path, *, write_manifest: bool = False):
     else:
         write_mode = "w"
         pages_already_done = 0
+        file_offset = 0
+
+    last_valid_offset = file_offset
+    last_valid_pages = pages_already_done
 
     # Auto-detect file type using magic bytes separation
     with open(input_path, "rb") as test_f:
@@ -337,58 +374,83 @@ def extract_text_from_xml(input_path, *, write_manifest: bool = False):
             context = ET.iterparse(f, events=("end",))
 
             with open(output_path, write_mode, encoding="utf-8") as out:
-                for _, elem in context:
-                    if elem.tag.endswith("page"):
-                        pages_seen += 1
+                try:
+                    for _, elem in context:
+                        if elem.tag.endswith("page"):
+                            pages_seen += 1
 
-                        # Skip pages already processed in a previous run
-                        if pages_seen <= pages_already_done:
+                            # Skip pages already processed in a previous run
+                            if pages_seen <= pages_already_done:
+                                elem.clear()
+                                continue
+
+                            text_elem = elem.find(".//{*}text")
+
+                            if text_elem is not None and text_elem.text:
+                                cleaned = clean_wikitext(text_elem.text)
+                                if cleaned:
+                                    out.write(cleaned + "\n\n")
+
+                            pages_written += 1
                             elem.clear()
-                            continue
 
-                        text_elem = elem.find(".//{*}text")
-
-                        if text_elem is not None and text_elem.text:
-                            cleaned = clean_wikitext(text_elem.text)
-                            if cleaned:
-                                out.write(cleaned + "\n\n")
-
-                        pages_written += 1
-                        elem.clear()
-
-                        # Flush output and save checkpoint periodically
-                        if pages_written % CHECKPOINT_INTERVAL == 0:
-                            out.flush()
-                            _save_checkpoint(
-                                checkpoint_path,
-                                pages_written,
-                                input_identity,
-                                out.tell(),
-                            )
-    except KeyboardInterrupt:
-        current_offset = 0
-        if "out" in locals() and not out.closed:
-            out.flush()
-            current_offset = out.tell()
-        _save_checkpoint(
-            checkpoint_path, pages_written, input_identity, current_offset
-        )
-        logger.warning(
-            "Interrupted by user after %d pages. Run again to resume.", pages_written
-        )
-        raise
-    except Exception:
-        # Save progress before propagating the exception so the next run can resume
-        current_offset = 0
-        if "out" in locals() and not out.closed:
-            out.flush()
-            current_offset = out.tell()
-        _save_checkpoint(
-            checkpoint_path, pages_written, input_identity, current_offset
-        )
-        logger.error(
-            "Processing interrupted after %d pages. Run again to resume.", pages_written
-        )
+                            # Flush output and save checkpoint periodically
+                            if pages_written % CHECKPOINT_INTERVAL == 0:
+                                out.flush()
+                                last_valid_offset = out.tell()
+                                last_valid_pages = pages_written
+                                prefix_hash = _compute_file_prefix_sha256(output_path, last_valid_offset)
+                                _save_checkpoint(
+                                    checkpoint_path,
+                                    pages_written,
+                                    input_identity,
+                                    last_valid_offset,
+                                    prefix_hash,
+                                )
+                except KeyboardInterrupt:
+                    out.flush()
+                    last_valid_offset = out.tell()
+                    last_valid_pages = pages_written
+                    prefix_hash = _compute_file_prefix_sha256(output_path, last_valid_offset)
+                    _save_checkpoint(
+                        checkpoint_path,
+                        last_valid_pages,
+                        input_identity,
+                        last_valid_offset,
+                        prefix_hash,
+                    )
+                    logger.warning(
+                        "Interrupted by user after %d pages. Run again to resume.", pages_written
+                    )
+                    raise
+                except Exception:
+                    out.flush()
+                    last_valid_offset = out.tell()
+                    last_valid_pages = pages_written
+                    prefix_hash = _compute_file_prefix_sha256(output_path, last_valid_offset)
+                    _save_checkpoint(
+                        checkpoint_path,
+                        last_valid_pages,
+                        input_identity,
+                        last_valid_offset,
+                        prefix_hash,
+                    )
+                    logger.error(
+                        "Processing interrupted after %d pages. Run again to resume.", pages_written
+                    )
+                    raise
+    except (KeyboardInterrupt, Exception):
+        # If an unhandled exception occurred outside the inner writer (e.g. while opening),
+        # ensure checkpoint retains the last known valid state rather than resetting to 0.
+        if last_valid_pages > 0 and output_path.exists():
+            prefix_hash = _compute_file_prefix_sha256(output_path, last_valid_offset)
+            _save_checkpoint(
+                checkpoint_path,
+                last_valid_pages,
+                input_identity,
+                last_valid_offset,
+                prefix_hash,
+            )
         raise
 
     # Processing finished successfully — remove checkpoint so a fresh
