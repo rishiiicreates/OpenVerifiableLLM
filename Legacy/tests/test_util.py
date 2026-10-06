@@ -340,3 +340,87 @@ def test_extract_text_from_xml_malformed_xml(tmp_path, monkeypatch):
 
     with pytest.raises(ET.ParseError):
         utils.extract_text_from_xml(input_file)
+
+
+def test_extract_text_from_xml_resume_truncates_and_avoids_duplicates(tmp_path, monkeypatch):
+    xml_content = """<?xml version="1.0"?>
+    <mediawiki>
+      <page>
+        <revision><text>First Page Content</text></revision>
+      </page>
+      <page>
+        <revision><text>Second Page Content</text></revision>
+      </page>
+      <page>
+        <revision><text>Third Page Content</text></revision>
+      </page>
+      <page>
+        <revision><text>Fourth Page Content</text></revision>
+      </page>
+    </mediawiki>
+    """
+    input_file = tmp_path / "simplewiki-pages.xml"
+    input_file.write_text(xml_content, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    processed_dir = tmp_path / "data" / "processed"
+    processed_dir.mkdir(parents=True, exist_ok=True)
+    output_file = processed_dir / "wiki_clean.txt"
+    checkpoint_file = processed_dir / "wiki_clean.checkpoint.json"
+
+    # Pre-populate output with pages 1 and 2
+    output_file.write_text("First Page Content\n\nSecond Page Content\n\n", encoding="utf-8")
+    valid_offset = output_file.stat().st_size
+
+    # Simulate an interruption where page 3 was partially written or appended
+    # before the next checkpoint was saved
+    output_file.write_text(
+        "First Page Content\n\nSecond Page Content\n\nThird Page Content (partial/uncommitted)\n\n",
+        encoding="utf-8",
+    )
+
+    # Save checkpoint recorded after 2 pages at valid_offset
+    input_identity = utils._compute_input_identity(input_file)
+    utils._save_checkpoint(checkpoint_file, 2, input_identity, valid_offset)
+
+    # Resume processing
+    utils.extract_text_from_xml(input_file)
+
+    result_text = output_file.read_text(encoding="utf-8")
+    # Verify uncommitted partial text was truncated away and no duplicate pages exist
+    assert "Third Page Content (partial/uncommitted)" not in result_text
+    assert result_text.count("First Page Content") == 1
+    assert result_text.count("Second Page Content") == 1
+    assert result_text.count("Third Page Content") == 1
+    assert result_text.count("Fourth Page Content") == 1
+    assert not checkpoint_file.exists(), "Checkpoint should be removed on successful completion"
+
+
+def test_extract_text_from_xml_resume_invalid_checkpoint_starts_fresh(tmp_path, monkeypatch):
+    xml_content = """<?xml version="1.0"?>
+    <mediawiki>
+      <page>
+        <revision><text>Clean Fresh Run</text></revision>
+      </page>
+    </mediawiki>
+    """
+    input_file = tmp_path / "simplewiki-pages.xml"
+    input_file.write_text(xml_content, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    processed_dir = tmp_path / "data" / "processed"
+    processed_dir.mkdir(parents=True, exist_ok=True)
+    output_file = processed_dir / "wiki_clean.txt"
+    checkpoint_file = processed_dir / "wiki_clean.checkpoint.json"
+
+    # Save invalid checkpoint with wrong identity and stale output
+    output_file.write_text("Old Stale Data\n\n", encoding="utf-8")
+    utils._save_checkpoint(checkpoint_file, 5, "wrong_sha256_hash", 100)
+
+    # Should detect invalid checkpoint and start fresh
+    utils.extract_text_from_xml(input_file)
+
+    result_text = output_file.read_text(encoding="utf-8")
+    assert "Old Stale Data" not in result_text
+    assert "Clean Fresh Run" in result_text
+
