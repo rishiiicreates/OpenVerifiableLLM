@@ -184,6 +184,58 @@ class TestTokenizeDatasetPipeline(unittest.TestCase):
         with self.assertRaises(ValueError):
             tokenize_dataset(self.text_file, self.tok_dir, self.text_file)
 
+    def test_manifest_samefile_rejection(self):
+        # Manifest pointing to input file directly
+        with self.assertRaises(ValueError):
+            tokenize_dataset(
+                self.text_file,
+                self.tok_dir,
+                self.output_bin,
+                manifest_path=self.text_file,
+                write_manifest=True,
+            )
+
+        # Manifest pointing to output file
+        with self.assertRaises(ValueError):
+            tokenize_dataset(
+                self.text_file,
+                self.tok_dir,
+                self.output_bin,
+                manifest_path=self.output_bin,
+                write_manifest=True,
+            )
+
+        # Manifest pointing to symlink of input file
+        symlink_in = self.tmp / "input_link.txt"
+        symlink_in.symlink_to(self.text_file)
+        with self.assertRaises(ValueError):
+            tokenize_dataset(
+                self.text_file,
+                self.tok_dir,
+                self.output_bin,
+                manifest_path=symlink_in,
+                write_manifest=True,
+            )
+
+    def test_atomic_output_symlink_replacement(self):
+        # Ensure that if output_bin is an existing symlink pointing elsewhere,
+        # it is replaced without mutating the original symlink target
+        decoy_target = self.tmp / "decoy.txt"
+        decoy_target.write_bytes(b"untouched original content")
+        self.output_bin.symlink_to(decoy_target)
+
+        tokenize_dataset(
+            input_file=self.text_file,
+            tokenizer=self.tok_dir,
+            output_file=self.output_bin,
+            write_manifest=False,
+        )
+
+        self.assertFalse(self.output_bin.is_symlink())
+        self.assertTrue(self.output_bin.is_file())
+        self.assertEqual(decoy_target.read_bytes(), b"untouched original content")
+
+
     def test_token_id_range_validation(self):
         class DummyNegativeTokenizer:
             def encode(self, text):

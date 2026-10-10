@@ -1,7 +1,12 @@
 from datetime import datetime, timezone
+import hashlib
+import io
 import json
 import logging
+import os
 from pathlib import Path
+import stat
+import tempfile
 from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
@@ -85,15 +90,28 @@ def tokenize_dataset(
     if not input_path.is_file():
         raise FileNotFoundError(f"Input dataset file not found: {input_path}")
 
-    if output_path.exists():
+    def _is_same_file(p1: Path, p2: Path) -> bool:
+        if p1.exists() and p2.exists():
+            try:
+                if p1.samefile(p2):
+                    return True
+            except OSError:
+                pass
         try:
-            if input_path.samefile(output_path):
-                raise ValueError(f"Input file and output file cannot be the same file: {input_path}")
+            return p1.resolve() == p2.resolve()
         except OSError:
-            if input_path.resolve() == output_path.resolve():
-                raise ValueError(f"Input file and output file cannot be the same file: {input_path}")
-    elif input_path.resolve() == output_path.resolve():
+            return p1.absolute() == p2.absolute()
+
+    if _is_same_file(input_path, output_path):
         raise ValueError(f"Input file and output file cannot be the same file: {input_path}")
+
+    target_manifest: Optional[Path] = None
+    if write_manifest:
+        target_manifest = Path(manifest_path) if manifest_path is not None else output_path.parent / "tokenized_manifest.json"
+        if _is_same_file(input_path, target_manifest):
+            raise ValueError(f"Input file and manifest file cannot be the same file: {target_manifest}")
+        if _is_same_file(output_path, target_manifest):
+            raise ValueError(f"Output file and manifest file cannot be the same file: {target_manifest}")
 
     if dtype not in SUPPORTED_DTYPES:
         raise ValueError(
@@ -137,46 +155,81 @@ def tokenize_dataset(
 
     logger.info("Starting deterministic streaming tokenization: %s -> %s", input_path, output_path)
 
-    with input_path.open("r", encoding="utf-8") as fin, output_path.open("wb") as fout:
-        for line in fin:
-            text = line.strip()
-            if not text:
-                continue
+    tmp_out = tempfile.NamedTemporaryFile(
+        dir=output_path.parent,
+        prefix=f".{output_path.name}.tmp_",
+        delete=False,
+    )
+    tmp_out_path = Path(tmp_out.name)
+    input_hasher = hashlib.sha256()
 
-            encoded = tok_instance.encode(text)
-            if isinstance(encoded, list):
-                token_ids = encoded
-            elif hasattr(encoded, "ids"):
-                token_ids = encoded.ids
-            else:
-                raise TypeError(
-                    f"Tokenizer.encode() returned unsupported type: {type(encoded).__name__}. "
-                    "Expected list of ints or object with 'ids' attribute."
-                )
+    try:
+        with input_path.open("rb") as fin_raw, tmp_out as fout:
+            st = os.fstat(fin_raw.fileno())
+            if not stat.S_ISREG(st.st_mode):
+                raise ValueError(f"Input path must be a regular file: {input_path}")
 
-            if not token_ids:
-                continue
+            text_stream = io.TextIOWrapper(fin_raw, encoding="utf-8", errors="strict")
+            for line in text_stream:
+                text = line.strip()
+                if not text:
+                    continue
 
-            for tid in token_ids:
-                if not isinstance(tid, (int, np.integer)) or isinstance(tid, bool):
-                    raise TypeError(f"Token ID must be an integer, got {type(tid).__name__}: {tid}")
-                if tid < min_val or tid > max_val:
-                    raise ValueError(
-                        f"Token ID {tid} is outside allowable range [{min_val}, {max_val}] for {dtype}"
+                encoded = tok_instance.encode(text)
+                if isinstance(encoded, list):
+                    token_ids = encoded
+                elif hasattr(encoded, "ids"):
+                    token_ids = encoded.ids
+                else:
+                    raise TypeError(
+                        f"Tokenizer.encode() returned unsupported type: {type(encoded).__name__}. "
+                        "Expected list of ints or object with 'ids' attribute."
                     )
 
-            arr = np.array(token_ids, dtype=np_dtype)
-            raw_bytes = arr.tobytes()
-            fout.write(raw_bytes)
+                if not token_ids:
+                    continue
 
-            total_tokens += len(token_ids)
-            total_bytes += len(raw_bytes)
+                for tid in token_ids:
+                    if not isinstance(tid, (int, np.integer)) or isinstance(tid, bool):
+                        raise TypeError(f"Token ID must be an integer, got {type(tid).__name__}: {tid}")
+                    if tid < min_val or tid > max_val:
+                        raise ValueError(
+                            f"Token ID {tid} is outside allowable range [{min_val}, {max_val}] for {dtype}"
+                        )
 
-        fout.flush()
+                arr = np.array(token_ids, dtype=np_dtype)
+                raw_bytes = arr.tobytes()
+                fout.write(raw_bytes)
 
-    input_sha256 = compute_sha256(file_path=input_path)
-    tokenized_sha256 = compute_sha256(file_path=output_path)
-    merkle_root = compute_merkle_root(output_path, chunk_size=chunk_size_bytes)
+                total_tokens += len(token_ids)
+                total_bytes += len(raw_bytes)
+
+            fout.flush()
+            os.fsync(fout.fileno())
+
+            # Read and hash input_path through the same opened file handle
+            fin_raw.seek(0)
+            while block := fin_raw.read(65536):
+                input_hasher.update(block)
+            input_sha256 = input_hasher.hexdigest()
+
+        tokenized_sha256 = compute_sha256(file_path=tmp_out_path)
+        merkle_root = compute_merkle_root(tmp_out_path, chunk_size=chunk_size_bytes)
+
+        if output_path.is_symlink():
+            output_path.unlink()
+        elif output_path.exists():
+            if _is_same_file(input_path, output_path):
+                raise ValueError(f"Input file and output file cannot be the same file: {input_path}")
+
+        os.replace(tmp_out_path, output_path)
+    except Exception:
+        if tmp_out_path.exists():
+            try:
+                tmp_out_path.unlink()
+            except OSError:
+                pass
+        raise
 
     parent_manifest_hash: Optional[str] = None
     if previous_manifest_path is not None:
@@ -206,12 +259,31 @@ def tokenize_dataset(
         "parent_manifest_hash": parent_manifest_hash,
     }
 
-    if write_manifest:
-        if manifest_path is None:
-            manifest_path = output_path.parent / "tokenized_manifest.json"
-        target_manifest = Path(manifest_path)
+    if write_manifest and target_manifest is not None:
         target_manifest.parent.mkdir(parents=True, exist_ok=True)
-        target_manifest.write_text(_canonical_json(manifest_data), encoding="utf-8")
+        tmp_mf = tempfile.NamedTemporaryFile(
+            dir=target_manifest.parent,
+            prefix=f".{target_manifest.name}.tmp_",
+            mode="w",
+            encoding="utf-8",
+            delete=False,
+        )
+        tmp_mf_path = Path(tmp_mf.name)
+        try:
+            with tmp_mf as f_mf:
+                f_mf.write(_canonical_json(manifest_data))
+                f_mf.flush()
+                os.fsync(f_mf.fileno())
+            if target_manifest.is_symlink():
+                target_manifest.unlink()
+            os.replace(tmp_mf_path, target_manifest)
+        except Exception:
+            if tmp_mf_path.exists():
+                try:
+                    tmp_mf_path.unlink()
+                except OSError:
+                    pass
+            raise
         logger.info("Saved tokenized dataset manifest to %s", target_manifest)
 
     return manifest_data
